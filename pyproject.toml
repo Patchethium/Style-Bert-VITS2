@@ -7,7 +7,7 @@ name = "style-bert-vits2"
 dynamic = ["version"]
 description = "Style-Bert-VITS2: Bert-VITS2 with more controllable voice styles."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "AGPL-3.0"
 keywords = []
 authors = [
@@ -154,3 +154,4 @@ extend-select = ["I"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
+
