@@ -1155,3 +1155,135 @@ class SynthesizerTrn(nn.Module):
         z = self.flow(z_p, y_mask, g=g, reverse=True)
         o = self.dec((z * y_mask)[:, :, :max_len], g=g)
         return o, attn, y_mask, (z, z_p, m_p, logs_p)
+
+    # gets the splitted modules for explict duration control
+    # and stream decoding
+    # fuzzy type annotation is used to avoid circular reference
+    def split(self) -> tuple[nn.Module, nn.Module, nn.Module, nn.Module]:
+        # submodels to ease the transition
+        # not used in training
+        class InferModule(nn.Module):
+            def forward(self) -> None:
+                raise NotImplementedError("This module is for inference only")
+
+        class SpkEmb(InferModule):
+            def __init__(self, model: SynthesizerTrn):
+                """
+                The emb_g, aka speaker embedding
+                Returns the speaker embedding of course, which is feeded to all 3 sub modules
+                """
+                self.emb_g = model.emb_g
+                self.ref_enc = model.ref_enc
+                self.n_speakers = model.n_speakers
+
+            def infer(self, s: torch.Tensor):
+                """
+                s could be speaker id or a reference audio(y)
+                the latter branch is actually not used
+                but kept for consistency
+                """
+                if self.n_speakers > 0:
+                    g = self.emb_g(s).unsqueeze(-1)  # [b, h, 1]
+                else:
+                    g = self.ref_enc(s.transpose(1, 2)).unsqueeze(-1)
+                return g
+
+        class TextDur(InferModule):
+            def __init__(self, model: SynthesizerTrn):
+                """
+                The first half process, including text encoder, dp and sdp
+                Returns the hidden state and explicit duration
+                """
+                self.enc_p = model.enc_p
+                self.dp = model.dp
+                self.sdp = model.sdp
+
+            def infer(
+                self,
+                x: torch.Tensor,
+                x_lengths: torch.Tensor,
+                g: torch.Tensor,
+                tone: torch.Tensor,
+                language: torch.Tensor,
+                bert: torch.Tensor,
+                style_vec: torch.Tensor,
+                length_scale: float = 1.0,
+                noise_scale_w: float = 0.8,
+                sdp_ratio: float = 0.0,
+            ):
+                x, m_p, logs_p, x_mask = self.enc_p(
+                    x, x_lengths, tone, language, bert, style_vec, g=g
+                )
+                logw = self.sdp(
+                    x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w
+                ) * (sdp_ratio) + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
+                w = torch.exp(logw) * x_mask * length_scale
+                w_ceil = torch.ceil(w)
+
+                return m_p, logs_p, x_mask, w_ceil
+
+        class Flow(InferModule):
+            def __init__(self, model: SynthesizerTrn):
+                """
+                The mid process, including flow
+                Returns the vae embedding for decoder
+                """
+                # the `emb_g`, aka `speaker embedding`, gets duplicated in each sub module
+                # considering its relative small parameter amount
+                # the size increment is acceptable compared to the benefit
+                self.flow = model.flow
+
+            def infer(
+                self,
+                m_p: torch.Tensor,
+                logs_p: torch.Tensor,
+                w_ceil: torch.Tensor,
+                g: torch.Tensor,
+                x_mask: torch.Tensor,
+                noise: Optional[torch.Tensor] = None, # noise can be assigned now
+                noise_scale: float = 0.667,
+            ):
+                y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+                y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
+                    m_p.device
+                )
+                attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+                attn = commons.generate_path(w_ceil, attn_mask)
+                m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(
+                    1, 2
+                )  # [b, t', t], [b, t, d] -> [b, d, t']
+                logs_p = torch.matmul(
+                    attn.squeeze(1), logs_p.transpose(1, 2)
+                ).transpose(
+                    1, 2
+                )  # [b, t', t], [b, t, d] -> [b, d, t']
+                if noise is None:
+                    noise = torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+                z_p = m_p + noise
+                z = self.flow(z_p, y_mask, g=g, reverse=True)
+                z = z * y_mask
+                return z
+
+        class Decoder(InferModule):
+            def __init__(self, model: SynthesizerTrn):
+                """
+                The last process, including the decoder
+                Returns the waveform that can be heard
+
+                Supports streaming decoding as it's
+                time in-variant within its receptive fields
+                """
+                self.emb_g = model.emb_g
+                self.dec = model.dec
+
+            def infer(
+                self, g: torch.Tensor, z: torch.Tensor, max_len: Optional[int] = None
+            ):
+                return self.dec(z[:, :, :max_len], g=g)
+
+        spk_emb = SpkEmb(self)
+        text_dur = TextDur(self)
+        flow = Flow(self)
+        dec = Decoder(self)
+
+        return (spk_emb, text_dur, flow, dec)
