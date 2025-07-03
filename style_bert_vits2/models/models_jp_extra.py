@@ -1162,21 +1162,19 @@ class SynthesizerTrn(nn.Module):
     def split(self) -> tuple[nn.Module, nn.Module, nn.Module, nn.Module]:
         # submodels to ease the transition
         # not used in training
-        class InferModule(nn.Module):
-            def forward(self) -> None:
-                raise NotImplementedError("This module is for inference only")
 
-        class SpkEmb(InferModule):
+        class SpkEmb(nn.Module):
             def __init__(self, model: SynthesizerTrn):
                 """
                 The emb_g, aka speaker embedding
                 Returns the speaker embedding of course, which is feeded to all 3 sub modules
                 """
+                super().__init__()
                 self.emb_g = model.emb_g
-                self.ref_enc = model.ref_enc
+                # self.ref_enc = model.ref_enc
                 self.n_speakers = model.n_speakers
 
-            def infer(self, s: torch.Tensor):
+            def forward(self, s: torch.Tensor):
                 """
                 s could be speaker id or a reference audio(y)
                 the latter branch is actually not used
@@ -1185,24 +1183,26 @@ class SynthesizerTrn(nn.Module):
                 if self.n_speakers > 0:
                     g = self.emb_g(s).unsqueeze(-1)  # [b, h, 1]
                 else:
-                    g = self.ref_enc(s.transpose(1, 2)).unsqueeze(-1)
+                    # g = self.ref_enc(s.transpose(1, 2)).unsqueeze(-1)
+                    raise NotImplementedError("I'll handle this later, bruhh")
                 return g
 
-        class TextDur(InferModule):
+        class TextDur(nn.Module):
             def __init__(self, model: SynthesizerTrn):
                 """
                 The first half process, including text encoder, dp and sdp
                 Returns the hidden state and explicit duration
                 """
+                super().__init__()
                 self.enc_p = model.enc_p
                 self.dp = model.dp
                 self.sdp = model.sdp
 
-            def infer(
+            def forward(
                 self,
                 x: torch.Tensor,
                 x_lengths: torch.Tensor,
-                g: torch.Tensor,
+                g: torch.Tensor,  # speaker embedding
                 tone: torch.Tensor,
                 language: torch.Tensor,
                 bert: torch.Tensor,
@@ -1222,25 +1222,23 @@ class SynthesizerTrn(nn.Module):
 
                 return m_p, logs_p, x_mask, w_ceil
 
-        class Flow(InferModule):
+        class Flow(nn.Module):
             def __init__(self, model: SynthesizerTrn):
                 """
                 The mid process, including flow
                 Returns the vae embedding for decoder
                 """
-                # the `emb_g`, aka `speaker embedding`, gets duplicated in each sub module
-                # considering its relative small parameter amount
-                # the size increment is acceptable compared to the benefit
+                super().__init__()
                 self.flow = model.flow
 
-            def infer(
+            def forward(
                 self,
                 m_p: torch.Tensor,
                 logs_p: torch.Tensor,
                 w_ceil: torch.Tensor,
                 g: torch.Tensor,
                 x_mask: torch.Tensor,
-                noise: Optional[torch.Tensor] = None, # noise can be assigned now
+                eps: torch.Tensor,
                 noise_scale: float = 0.667,
             ):
                 y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
@@ -1257,14 +1255,13 @@ class SynthesizerTrn(nn.Module):
                 ).transpose(
                     1, 2
                 )  # [b, t', t], [b, t, d] -> [b, d, t']
-                if noise is None:
-                    noise = torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+                noise = eps * torch.exp(logs_p) * noise_scale
                 z_p = m_p + noise
                 z = self.flow(z_p, y_mask, g=g, reverse=True)
                 z = z * y_mask
                 return z
 
-        class Decoder(InferModule):
+        class Decoder(nn.Module):
             def __init__(self, model: SynthesizerTrn):
                 """
                 The last process, including the decoder
@@ -1273,10 +1270,11 @@ class SynthesizerTrn(nn.Module):
                 Supports streaming decoding as it's
                 time in-variant within its receptive fields
                 """
+                super().__init__()
                 self.emb_g = model.emb_g
                 self.dec = model.dec
 
-            def infer(
+            def forward(
                 self, g: torch.Tensor, z: torch.Tensor, max_len: Optional[int] = None
             ):
                 return self.dec(z[:, :, :max_len], g=g)
